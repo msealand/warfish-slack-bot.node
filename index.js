@@ -1,8 +1,54 @@
 const request = require('request');
 const urlUtils = require('url');
+const Feedparser = require('feedparser');
 
 const REST_API_URL = process.env["REST_API_URL"] || 'http://warfish.net/war/services/rest.py';
-const gameIds = (process.env["GAME_IDS"] || "20129138,44843295" || "").split(',').map(s => s.trim());
+
+function getRSSGames(feedUrl) {
+    return new Promise((resolve, reject) => {
+        let data = {
+            url: feedUrl
+        }
+
+        let games = [];
+        let feedparser = new Feedparser();
+        request(data).pipe(feedparser);
+        
+        feedparser.on('error', function (error) {
+            console.log(`Parse error: ${error.message || error}`);
+            reject(error);
+        });
+
+        feedparser.on('readable', function () {
+            let meta = this.meta;
+            let item;
+
+            while (item = this.read()) {
+                try {
+                    let name = item.title;
+                    let url = urlUtils.parse(item.link);
+                    let queries = url.query.split('&').map((q) => {
+                        let parts = q.split('=');
+                        return { name: parts[0], value: parts[1] }
+                    }).reduce((data, q) => {
+                        data[q.name] = q.value;
+                        return data;
+                    }, {})
+
+                    if (queries.gid) {
+                        let gid = queries.gid;
+                        name = name.replace(/^[0-9]+\.?\s*/, '');
+                        games.push({ name: name, gid: gid });
+                    }
+                } catch (_) {}
+            }
+        });
+
+        feedparser.on('end', () => {
+            resolve(games);
+        });
+    });
+}
 
 function getPlayerStates(gid) {
     let params = {
@@ -37,6 +83,14 @@ function getPlayerStates(gid) {
 
 }
 
+function getGameStats(gids) {
+    let gameIds = games.map(g => g.gid);
+    return Promise.all(gameIds.map(getPlayerStates)).then((gamePlayerStates) => {
+        gamePlayerStates.sort((gps1, gps2) => (gps1.gameId - gps2.gameId));
+        return gamePlayerStates
+    });
+}
+
 function displayTurns(playerStates) {
     let turns = playerStates.filter((player) => player.isturn == "1");
     if (turns.length > 0) {
@@ -63,10 +117,22 @@ function displayTurns(playerStates) {
     console.log();
 }
 
-Promise.all(gameIds.map(getPlayerStates)).then((gamePlayerStates) => {
-    gamePlayerStates.sort((gps1, gps2) => (gps1.gameId - gps2.gameId));
-    gamePlayerStates.forEach((gps) => {
-        console.log(`GameId: ${gps.gameId}`);
-        displayTurns(gps.playerStates);
-    });
-})
+function displayGameState(games) {
+    let gameIds = games.map(g => g.gid);
+    Promise.all(gameIds.map(getPlayerStates)).then((gamePlayerStates) => {
+        gamePlayerStates.sort((gps1, gps2) => (gps1.gameId - gps2.gameId));
+        gamePlayerStates.forEach((gps) => {
+            console.log(`GameId: ${gps.gameId}`);
+
+            console.log(`Player States:\n${JSON.stringify(gps.playerStates, null, 2)}`);
+
+            displayTurns(gps.playerStates);
+        });
+    })
+}
+
+getRSSGames().then(displayGameState);
+
+module.exports.getRSSGames = getRSSGames;
+module.exports.getGameStats = getGameStats;
+module.exports.getPlayerStates = getPlayerStates;
