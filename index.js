@@ -1,138 +1,106 @@
+const restify = require('restify');
+const warfish = require('./warfish');
 const request = require('request');
-const urlUtils = require('url');
-const Feedparser = require('feedparser');
+const slack = require('@slack/client');
 
-const REST_API_URL = process.env["REST_API_URL"] || 'http://warfish.net/war/services/rest.py';
+const TOKEN = process.env["TOKEN"] || '';
+const slackClient = new slack.WebClient(TOKEN);
 
-function getRSSGames(feedUrl) {
-    return new Promise((resolve, reject) => {
-        let data = {
-            url: feedUrl
-        }
-
-        let games = [];
-        let feedparser = new Feedparser();
-        request(data).pipe(feedparser);
-        
-        feedparser.on('error', function (error) {
-            console.log(`Parse error: ${error.message || error}`);
-            reject(error);
-        });
-
-        feedparser.on('readable', function () {
-            let meta = this.meta;
-            let item;
-
-            while (item = this.read()) {
-                try {
-                    let name = item.title;
-                    let url = urlUtils.parse(item.link);
-                    let queries = url.query.split('&').map((q) => {
-                        let parts = q.split('=');
-                        return { name: parts[0], value: parts[1] }
-                    }).reduce((data, q) => {
-                        data[q.name] = q.value;
-                        return data;
-                    }, {})
-
-                    if (queries.gid) {
-                        let gid = queries.gid;
-                        name = name.replace(/^[0-9]+\.?\s*/, '');
-                        games.push({ name: name, gid: gid });
-                    }
-                } catch (_) {}
-            }
-        });
-
-        feedparser.on('end', () => {
-            resolve(games);
-        });
-    });
+function healthCheck(req, res, next) {
+    res.send({ status: 'ok' });
+    next();
 }
 
-function getPlayerStates(gid) {
-    let params = {
-        _format: 'json',
-        _method: 'warfish.tables.getState',
-        gid: gid,
-        sections: 'players'
-    }
+function addRSS(req, res, next) {
+    console.log(`Add RSS request`);
+    //console.log(req.body);
 
-    let req = {
-        url: REST_API_URL,
-        qs: params,
-        json: true
-    }
+    let feedUrl = req.body.text;
+    let responseUrl = req.body.response_url;
+    res.send({ text: `Processing RSS feed ${feedUrl}...` });
 
-    return new Promise((resolve, reject) => {
-        request(req, (err, response) => {
-            if (err) { 
-                return reject(err);
-            } else if (response) {
-                let state = response.body;
-                if (!state) { return reject(new Error("Invalid response (no body)")) }
-                let playerStates = (((state._content || {}).players || {})._content || {}).player;
-                if (!playerStates) { return reject(new Error("Invalid response (no players)")) }
+    processRSSFeed(feedUrl, responseUrl);
 
-                return resolve({ gameId: gid, playerStates: playerStates });
-            } else {
-                return reject(new Error("Invalid response"));
-            }
-        });
-    });
-
+    next();
 }
 
-function getGameStats(gids) {
-    let gameIds = games.map(g => g.gid);
-    return Promise.all(gameIds.map(getPlayerStates)).then((gamePlayerStates) => {
-        gamePlayerStates.sort((gps1, gps2) => (gps1.gameId - gps2.gameId));
-        return gamePlayerStates
-    });
-}
+function checkGameChannel(game) {
+    console.log(`GAME: ${JSON.stringify(game, null, 2)}`);
 
-function displayTurns(playerStates) {
-    let turns = playerStates.filter((player) => player.isturn == "1");
-    if (turns.length > 0) {
-        turns = turns.map(p => p.name).sort();
-        let lastName = turns.pop();
-        if (lastName.toLowerCase()[lastName.length - 1] == 's') { lastName += "'"; }
-        else { lastName += "'s"; }
-        turns.push(lastName);
-        if (turns.length > 2) { 
-            turns.push(`and ${turns.pop()}`);
-            if (turns.length > 1) {
-                turns = turns.join(', '); 
-            }
-        } else if (turns.length > 1) {
-            turns = turns.join(' and ');
+    slackClient.channels.list((err, info) => {
+        if (err) {
+            console.log(`Error: ${err}`);
         } else {
-            turns = turns[0];
+            // console.log(JSON.stringify(info, null, 2));
+            info.channels.forEach((channel) => {
+                console.log(`Channel ${channel.name}`);
+            });
         }
-        console.log(`It is ${turns} turn`);
-    } else {
-        console.log(`Game over!`);
-    }
-
-    console.log();
+    });
 }
 
-function displayGameState(games) {
-    let gameIds = games.map(g => g.gid);
-    Promise.all(gameIds.map(getPlayerStates)).then((gamePlayerStates) => {
-        gamePlayerStates.sort((gps1, gps2) => (gps1.gameId - gps2.gameId));
-        gamePlayerStates.forEach((gps) => {
-            console.log(`GameId: ${gps.gameId}`);
+function processRSSFeed(feedUrl, responseUrl) {
+    console.log(`Processing ${feedUrl}`);
 
-            console.log(`Player States:\n${JSON.stringify(gps.playerStates, null, 2)}`);
+    warfish.getRSSGames(feedUrl).then((games) => {
+        return warfish.getGameStats(games).then((gameStates) => {
+            gameStates.forEach((game) => {
 
-            displayTurns(gps.playerStates);
+                checkGameChannel(game);
+
+                let playerStates = game.playerStates;
+
+                let text;
+                let turns = playerStates.filter((player) => player.isturn == "1");
+                if (turns.length > 0) {
+                    turns = turns.map(p => p.name).sort();
+                    let lastName = turns.pop();
+                    if (lastName.toLowerCase()[lastName.length - 1] == 's') { lastName += "'"; }
+                    else { lastName += "'s"; }
+                    turns.push(lastName);
+                    if (turns.length > 2) {
+                        turns.push(`and ${turns.pop()}`);
+                        if (turns.length > 1) {
+                            turns = turns.join(', ');
+                        }
+                    } else if (turns.length > 1) {
+                        turns = turns.join(' and ');
+                    } else {
+                        turns = turns[0];
+                    }
+                    text = `It is ${turns} turn in ${game.name}`;
+                } else {
+                    text = `${game.name} is over!`;
+                }
+
+                if (text) {
+
+                    console.log(`Posting '${text}' to '${responseUrl}'`);
+
+                    let reqData = {
+                        uri: responseUrl,
+                        method: 'POST',
+                        json: { text: text }
+                    }
+                    request(reqData, (err, response, body) => {
+                        if (err) console.log(`Err: ${err.message || err}`);
+                        if (body) console.log(`Body: ${body}`);
+                    });
+                }
+            });
         });
-    })
+    });
 }
 
-getRSSGames().then(displayGameState);
+let server = restify.createServer();
+server.use(restify.plugins.bodyParser());
 
-module.exports.getRSSGames = getRSSGames;
-module.exports.getGameStats = getGameStats;
-module.exports.getPlayerStates = getPlayerStates;
+server.get('/health', healthCheck);
+server.head('/health', healthCheck);
+
+server.post('/cmd/rss', addRSS);
+
+server.listen(8080, () => {
+    console.log(`${server.name} listening at ${server.url}`);
+});
+
