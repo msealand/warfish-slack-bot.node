@@ -1,8 +1,120 @@
 const request = require('request');
 const urlUtils = require('url');
 const Feedparser = require('feedparser');
+const events = require('events');
 
 const REST_API_URL = process.env["REST_API_URL"] || 'http://warfish.net/war/services/rest.py';
+
+let _games = {};
+
+class WarFishGame extends events.EventEmitter {
+
+    constructor(data) {
+        super();
+
+        if (typeof data === 'string') { data = { id: data }; }
+        this._updateData(data);
+    }
+
+    setUpdateInterval(interval) {
+        if (!this._updateInterval) {
+            console.log(`Updating game ${this.id} every ${interval}ms`);
+
+            this._updateInterval = setInterval(() => {
+                console.log(`Checking for game ${this.id} updates`);
+
+                getGame(this);
+            }, interval);
+        }
+    }
+
+    clearUpdateInterval() {
+        clearInterval(this._updateInterval);
+        this._updateInterval = undefined;
+    }
+
+    get isWarFishGame() { return true; }
+
+    _checkPlayerDiffs(data) {
+        // console.log(`Diffing player data with: ${JSON.stringify(data || {}, null, 2)}`);
+
+        let playerDiffs = {};
+
+        let newPlayerData = ((data.players || {})._content || {}).player || [];
+        let existingPlayerData = this.players;
+
+        // This logic doesn't really work... player turns can get missed, etc.
+        
+        if (newPlayerData.length != existingPlayerData.length) {
+            let newProfiles = new Set(newPlayerData.map(p => p.profileid));
+            let existingProfiles = new Set(existingPlayerData.map(p => p.profileid));
+
+            let joinedSet = new Set(newProfiles);
+            existingProfiles.forEach(pid => joinedSet.delete(pid));
+
+            let leftSet = new Set(existingProfiles);
+            newProfiles.forEach(pid => leftSet.delete(pid));
+
+            playerDiffs.joined = Array.from(joinedSet);
+            playerDiffs.left = Array.from(leftSet);
+        }
+
+        let newTurns = new Set(newPlayerData.filter(p => p.isturn == "1").map(p => p.profileid));
+        let existingTurns = new Set(existingPlayerData.filter(p => p.isturn == "1").map(p => p.profileid));
+
+        let currentTurns = new Set(newTurns);
+        existingTurns.forEach(pid => currentTurns.delete(pid));
+        playerDiffs.turns = Array.from(currentTurns);
+
+        let newEliminated = new Set(newPlayerData.filter(p => p.active != "1").map(p => p.profileid));
+        let existingEliminated = new Set(existingPlayerData.filter(p => p.active != "1").map(p => p.profileid));
+
+        let currentEliminated = new Set(newEliminated);
+        existingEliminated.forEach(pid => currentEliminated.delete(pid));
+        playerDiffs.eliminated = Array.from(currentEliminated);
+
+        console.log(`Player diffs for game ${this.id}: ${JSON.stringify(playerDiffs, null, 2)}`);
+
+        return playerDiffs;
+    }
+
+    _updateData(data) {
+        if (data._content) { data = data._content; }
+
+        let playerDiffs = this._checkPlayerDiffs(data);
+        this._data = Object.assign(this._data || {}, data);
+
+        if (playerDiffs.left && (playerDiffs.left.length > 0)) { this.emit('players_left', playerDiffs.left); }        
+        if (playerDiffs.joined && (playerDiffs.joined.length > 0)) { this.emit('players_joined', playerDiffs.joined); }
+        if (playerDiffs.eliminated && (playerDiffs.eliminated.length > 0)) { this.emit('players_eliminated', playerDiffs.eliminated); }
+        if (playerDiffs.turns && (playerDiffs.turns.length > 0)) { this.emit('players_turns', playerDiffs.turns); }
+        
+        this.emit('game_updated', this);
+    }
+
+    get data() {
+        return this._data || {};
+    }
+
+    get id() {
+        return this.data.id;
+    }
+
+    get name() {
+        return `game-${this.id}`;
+    }
+
+    get players() {
+        return (((this.data.players || {})._content || {}).player) || [];
+    }
+
+    getPlayerName(pid) {
+        let name = pid;
+        let player = this.players.find(p => p.profileid == pid);
+        if (player && player.name) { name = player.name }
+        return name;
+    }
+}
 
 function getRSSGames(feedUrl) {
     return new Promise((resolve, reject) => {
@@ -37,8 +149,8 @@ function getRSSGames(feedUrl) {
 
                     if (queries.gid) {
                         let gid = queries.gid;
-                        name = name.replace(/^[0-9]+\.?\s*/, '');
-                        games.push({ name: name, id: gid });
+                        name = name.replace(/^\[?[0-9]+\]?\.?\-?\s*/, '');
+                        games.push(gid); //{ name: name, id: gid });
                     }
                 } catch (_) { }
             }
@@ -46,125 +158,56 @@ function getRSSGames(feedUrl) {
 
         feedparser.on('end', () => {
             resolve(games);
+
+            // Promise.all(games.map(getGame)).then((games) => {
+            //     resolve(games);
+            // });
         });
     });
 }
 
-function getGame(gameId) {
-    
-    let params = {
-        _format: 'json',
-        _method: 'warfish.tables.getState',
-        gid: gameId,
-        sections: 'cards,board,details,players'
-    }
-    
-    let req = {
-        url: REST_API_URL,
-        qs: params,
-        json: true
-    }
-
-    return new Promise((resolve, reject) => {
-        request(req, (err, response) => {
-            if (err) {
-                return reject(err);
-            } else if (response) {
-                let game = response.body;
-                resolve(game);
-            }
-        });
-    });
-}
-
-function getPlayerStates(game) {
-    let gid = game.id || game.gid || game.gameId;
-
-    let params = {
-        _format: 'json',
-        _method: 'warfish.tables.getState',
-        gid: gid,
-        sections: 'players'
-    }
-
-    let req = {
-        url: REST_API_URL,
-        qs: params,
-        json: true
-    }
-
-    return new Promise((resolve, reject) => {
-        request(req, (err, response) => {
-            if (err) {
-                return reject(err);
-            } else if (response) {
-                let state = response.body;
-
-                // console.log(JSON.stringify(response.body, null, 2));
-
-                if (!state) { return reject(new Error("Invalid response (no body)")) }
-                let playerStates = (((state._content || {}).players || {})._content || {}).player;
-                if (!playerStates) { return reject(new Error("Invalid response (no players)")) }
-
-                game.playerStates = playerStates;
-                return resolve(game);
-            } else {
-                return reject(new Error("Invalid response"));
-            }
-        });
-    });
-
-}
-
-function getGameStats(games) {
-    //    let gameIds = games.map(g => g.gid);
-    return Promise.all(games.map(getPlayerStates)).then((gamePlayerStates) => {
-        gamePlayerStates.sort((gps1, gps2) => (gps1.gameId - gps2.gameId));
-        return gamePlayerStates
-    });
-}
-
-function displayTurns(playerStates) {
-    let turns = playerStates.filter((player) => player.isturn == "1");
-    if (turns.length > 0) {
-        turns = turns.map(p => p.name).sort();
-        let lastName = turns.pop();
-        if (lastName.toLowerCase()[lastName.length - 1] == 's') { lastName += "'"; }
-        else { lastName += "'s"; }
-        turns.push(lastName);
-        if (turns.length > 2) {
-            turns.push(`and ${turns.pop()}`);
-            if (turns.length > 1) {
-                turns = turns.join(', ');
-            }
-        } else if (turns.length > 1) {
-            turns = turns.join(' and ');
-        } else {
-            turns = turns[0];
+function getGame(game) {
+    if (typeof game === 'string') { game = { id: game }; }
+    if (!game.isWarFishGame) { 
+        let wfGame = _games[game.id];
+        if (!wfGame) {
+            wfGame = new WarFishGame(game);
+            _games[wfGame.id] = wfGame;
         }
-        console.log(`It is ${turns} turn`);
-    } else {
-        console.log(`Game over!`);
+        game = wfGame;
     }
 
-    console.log();
-}
+    let sections = ['players','cards','board'];
+    // if (!game.details) { sections.push('details'); }
 
-function displayGameState(games) {
-    //    let gameIds = games.map(g => g.gid);
-    Promise.all(games.map(getPlayerStates)).then((gamePlayerStates) => {
-        gamePlayerStates.sort((gps1, gps2) => (gps1.gameId - gps2.gameId));
-        gamePlayerStates.forEach((gps) => {
-            console.log(`GameId: ${gps.gameId}`);
+    let params = {
+        _format: 'json',
+        _method: 'warfish.tables.getState',
+        gid: game.id,
+        sections: sections.join(',')
+    }
+    
+    let req = {
+        url: REST_API_URL,
+        qs: params,
+        json: true
+    }
 
-            console.log(`Player States:\n${JSON.stringify(gps.playerStates, null, 2)}`);
-
-            displayTurns(gps.playerStates);
+    // return new Promise((resolve, reject) => {
+        request(req, (err, response) => {
+            if (err) {
+                return reject(err);
+            } else if (response) {
+                let gameData = response.body;
+                game._updateData(gameData);
+                // resolve(game);
+            }
         });
-    })
+    // });
+
+    return game;
 }
 
+module.exports.WarFishGame = WarFishGame;
 module.exports.getRSSGames = getRSSGames;
-module.exports.getGameStats = getGameStats;
-module.exports.getPlayerStates = getPlayerStates;
 module.exports.getGame = getGame;
