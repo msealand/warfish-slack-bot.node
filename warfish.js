@@ -38,7 +38,7 @@ function getRSSGames(feedUrl) {
                     if (queries.gid) {
                         let gid = queries.gid;
                         name = name.replace(/^[0-9]+\.?\s*/, '');
-                        games.push({ name: name, gid: gid });
+                        games.push({ name: name, id: gid });
                     }
                 } catch (_) { }
             }
@@ -50,9 +50,35 @@ function getRSSGames(feedUrl) {
     });
 }
 
-function getPlayerStates(game) {
-    let gid = game.gid || game.gameId;
+function getGame(gameId) {
+    
+    let params = {
+        _format: 'json',
+        _method: 'warfish.tables.getState',
+        gid: gameId,
+        sections: 'cards,board,details,players'
+    }
+    
+    let req = {
+        url: REST_API_URL,
+        qs: params,
+        json: true
+    }
 
+    return new Promise((resolve, reject) => {
+        request(req, (err, response) => {
+            if (err) {
+                return reject(err);
+            } else if (response) {
+                let game = response.body;
+                resolve(game);
+            }
+        });
+    });
+}
+
+function getPlayerStates(game) {
+    let gid = game.id || game.gid || game.gameId;
 
     let params = {
         _format: 'json',
@@ -141,4 +167,4 @@ function displayGameState(games) {
 module.exports.getRSSGames = getRSSGames;
 module.exports.getGameStats = getGameStats;
 module.exports.getPlayerStates = getPlayerStates;
-
+module.exports.getGame = getGame;
